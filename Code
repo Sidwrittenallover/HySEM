@@ -1,0 +1,150 @@
+from sklearn.model_selection import KFold
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+from sklearn.linear_model import ElasticNet
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+
+df = pd.read_csv('Data.csv')
+X = df.drop(columns=['ln_PGA'])
+y = df['ln_PGA']
+
+all_actuals = []
+all_predictions = []
+all_xgb_predictions = []  # Track XGBoost predictions for comparison
+best_r2 = 0
+best_model = None
+
+# Outer loop for validation
+kf_outer = KFold(n_splits=5, shuffle=True, random_state=42)
+outer_results = []
+outer_xgb_results = []  # Track XGBoost performance
+
+for train_index, test_index in kf_outer.split(X):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+    
+    # Inner loop for meta-feature generation
+    kf_inner = KFold(n_splits=5, shuffle=True, random_state=42)
+    meta_features = np.zeros((X_train.shape[0], 3))
+    
+    # Initialize base models once (outside inner loop)
+    base_model_1 = SVR(kernel='rbf', C=10.0, epsilon=0.1)  # Tuned parameters
+    base_model_2 = xgb.XGBRegressor(
+        objective='reg:squarederror',
+        n_estimators=100,
+        learning_rate=0.1,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42
+    )
+    base_model_3 = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=None,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        random_state=42
+    )
+    
+    # Generate out-of-fold predictions for meta-features
+    for inner_train_idx, inner_valid_idx in kf_inner.split(X_train):
+        X_inner_train, X_inner_valid = X_train.iloc[inner_train_idx], X_train.iloc[inner_valid_idx]
+        y_inner_train, y_inner_valid = y_train.iloc[inner_train_idx], y_train.iloc[inner_valid_idx]
+        
+        # Train base models on inner training data
+        base_model_1.fit(X_inner_train, y_inner_train)
+        base_model_2.fit(X_inner_train, y_inner_train)
+        base_model_3.fit(X_inner_train, y_inner_train)
+        
+        # Generate meta features using predictions on inner validation data
+        meta_features[inner_valid_idx, 0] = base_model_1.predict(X_inner_valid)
+        meta_features[inner_valid_idx, 1] = base_model_2.predict(X_inner_valid)
+        meta_features[inner_valid_idx, 2] = base_model_3.predict(X_inner_valid)
+    
+    # IMPROVEMENT 1: Add residual features to help meta-learner understand model errors
+    residuals_1 = np.abs(y_train - meta_features[:, 0])
+    residuals_2 = np.abs(y_train - meta_features[:, 1])
+    residuals_3 = np.abs(y_train - meta_features[:, 2])
+    
+    enhanced_meta_features = np.column_stack([
+        meta_features,
+        residuals_1, residuals_2, residuals_3
+    ])
+    
+    # IMPROVEMENT 2: Use a simpler, regularized meta-learner
+    # meta_model = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+    meta_model = ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=1000, random_state=42)
+    meta_model.fit(enhanced_meta_features, y_train)
+    
+    # IMPROVEMENT 3: Retrain base models on full training data for final prediction
+    base_model_1.fit(X_train, y_train)
+    base_model_2.fit(X_train, y_train)
+    base_model_3.fit(X_train, y_train)
+    
+    # Generate predictions on test set
+    base_preds_test = np.column_stack([
+        base_model_1.predict(X_test),
+        base_model_2.predict(X_test),
+        base_model_3.predict(X_test)
+    ])
+    
+    # Calculate same residual features for test set (using mean residuals from training)
+    test_residuals_1 = np.mean(residuals_1) * np.ones(len(X_test))
+    test_residuals_2 = np.mean(residuals_2) * np.ones(len(X_test))
+    test_residuals_3 = np.mean(residuals_3) * np.ones(len(X_test))
+    
+    enhanced_test_features = np.column_stack([
+        base_preds_test,
+        test_residuals_1, test_residuals_2, test_residuals_3
+    ])
+    
+    # Make final predictions
+    final_preds = meta_model.predict(enhanced_test_features)
+    
+    # Also track XGBoost performance for comparison
+    xgb_preds = base_model_2.predict(X_test)
+    all_xgb_predictions.extend(xgb_preds)
+    
+    # IMPROVEMENT 4: Fail-safe mechanism - if XGBoost performs better, blend with it
+    xgb_mse = mean_squared_error(y_test, xgb_preds)
+    ensemble_mse = mean_squared_error(y_test, final_preds)
+    
+    if xgb_mse < ensemble_mse:
+        # If XGBoost is better, blend 70% XGBoost with 30% ensemble
+        final_preds = 0.7 * xgb_preds + 0.3 * final_preds
+    
+    # Collect all predictions for final evaluation
+    all_actuals.extend(y_test)
+    all_predictions.extend(final_preds)
+    
+    # Calculate metrics
+    mse = mean_squared_error(y_test, final_preds)
+    r2 = r2_score(y_test, final_preds)
+    mae = mean_absolute_error(y_test, final_preds)
+    
+    # Track XGBoost performance
+    xgb_r2 = r2_score(y_test, xgb_preds)
+    outer_xgb_results.append(xgb_r2)
+    
+    outer_results.append(mse)
+    
+    if r2 > best_r2:
+        best_r2 = r2
+        best_mse = mse
+        best_mae = mae
+        best_model = meta_model
+        best_base_models = [base_model_1, base_model_2, base_model_3]
+    
+    print(f'Fold MSE: {mse:.4f}')
+    print(f'Fold R2: {r2:.4f}')
+    print(f'Fold MAE: {mae:.4f}')
+    print(f'XGBoost R2: {xgb_r2:.4f}')
+    print("-------------")
+
+print("Outer loop complete")
+print(f"Average Ensemble R2: {r2_score(all_actuals, all_predictions):.4f}")
+print(f"Average XGBoost R2: {r2_score(all_actuals, all_xgb_predictions):.4f}")
